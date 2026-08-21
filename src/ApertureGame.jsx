@@ -1,64 +1,39 @@
-import React, { useState, useEffect, useRef } from "react";
-import { db } from "./firebase.js";
-import { ref, set, get, onValue, onChildAdded, push, child } from "firebase/database";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { get, onChildAdded, onValue, runTransaction, set } from "firebase/database";
+import { authReady } from "./firebase.js";
+import { FEED_LENGTH, MAX_GUESS, MAX_NAME, STAGES, STARTER_ROUNDS, awardPoints, stagePoints } from "./game/constants.js";
+import { genCode, genId, isCorrect } from "./game/text.js";
+import { ImageSourceError, assertUsableImage, loadImage, renderRoundFrames } from "./game/occlusion.js";
+import {
+  frameRef,
+  metaRef,
+  playerRef,
+  playersRef,
+  setlistRef,
+  stateRef,
+  submissionRef,
+  submissionsRef,
+} from "./game/paths.js";
 
 /* ────────────────────────────────────────────────────────────────
    APERTURE — a live "guess the image as the lens opens" party game
    Design language: camera / darkroom HUD. Warm black, amber optics.
-   Realtime sync via Firebase Realtime Database.
+
+   Players never receive the answers or the source images. The host's
+   browser flattens each aperture stage onto a canvas and publishes only
+   that stage's pixels; everything else is solid black in the bytes.
    ──────────────────────────────────────────────────────────────── */
 
-const STAGES = [
-  { scale: 4.2, vignette: 9, label: "PINHOLE", points: 1000 },
-  { scale: 3.2, vignette: 16, label: "SLIVER", points: 800 },
-  { scale: 2.3, vignette: 26, label: "NARROW", points: 600 },
-  { scale: 1.7, vignette: 42, label: "WIDENING", points: 400 },
-  { scale: 1.25, vignette: 68, label: "OPEN", points: 250 },
-  { scale: 1, vignette: 150, label: "FULL", points: 100 },
-];
-
-const STARTER_ROUNDS = [
-  { id: "s1", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Tour_Eiffel_Wikimedia_Commons.jpg", answer: "Eiffel Tower", hint: "Parisian landmark" },
-  { id: "s2", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Giraffe_Mikumi_National_Park.jpg", answer: "Giraffe", hint: "Tallest land mammal" },
-  { id: "s3", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Yellow_Rubber_Duck.jpg", answer: "Rubber Duck", hint: "Bath time icon" },
-  { id: "s4", url: "https://commons.wikimedia.org/wiki/Special:FilePath/GoldenGateBridge-001.jpg", answer: "Golden Gate Bridge", hint: "San Francisco crossing" },
-  { id: "s5", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Mona_Lisa.jpg", answer: "Mona Lisa", hint: "Mysterious smile" },
-  { id: "s6", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Strawberry.jpg", answer: "Strawberry", hint: "Seeded red fruit" },
-  { id: "s7", url: "https://commons.wikimedia.org/wiki/Special:FilePath/FullMoon2010.jpg", answer: "Moon", hint: "Earth's natural satellite" },
-  { id: "s8", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Great_Pyramid_of_Giza.jpg", answer: "Pyramid of Giza", hint: "Ancient wonder in Egypt" },
-  { id: "s9", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Basketball_Clipart.svg", answer: "Basketball", hint: "Orange pebbled sphere" },
-  { id: "s10", url: "https://commons.wikimedia.org/wiki/Special:FilePath/Tennis_Racket_and_Balls.jpg", answer: "Tennis Ball", hint: "Fuzzy neon sphere" },
-];
-
-const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ";
-const genCode = () => Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join("");
-const genId = () => Math.random().toString(36).slice(2, 10);
-const normalize = (s) => (s || "").toLowerCase().trim().replace(/[^a-z0-9 ]/g, "");
-const safeKey = (s) => normalize(s).replace(/\s+/g, "_") || genId(); // Firebase keys can't contain . # $ [ ] /
-const isCorrect = (guess, answer) => {
-  const g = normalize(guess), a = normalize(answer);
-  if (!g || !a) return false;
-  if (g === a) return true;
-  if (a.length > 3 && g.includes(a)) return true;
-  if (g.length > 3 && a.includes(g)) return true;
-  return false;
-};
-
-/* ---------- Firebase refs & helpers ---------- */
-const roomRef = (code) => ref(db, `rooms/${code}/state`);
-const playersRef = (code) => ref(db, `rooms/${code}/players`);
-const submissionsRef = (code, roundIdx) => ref(db, `rooms/${code}/submissions/${roundIdx}`);
-
-function freshState(code, hostName) {
+function freshState(code, hostName, roundCount) {
   return {
     code,
     host: hostName,
     status: "lobby", // lobby | playing | ended
-    rounds: STARTER_ROUNDS.map((r) => ({ ...r })),
+    roundCount,
     currentIndex: 0,
     stage: 0,
     roundActive: false,
-    creditedThisRound: {},
+    credited: {},
     scores: {},
     feed: [{ id: genId(), type: "system", text: "Room created. Waiting for players…" }],
     updatedAt: Date.now(),
@@ -66,161 +41,324 @@ function freshState(code, hostName) {
 }
 
 function pushFeed(state, entry) {
-  const feed = [{ id: genId(), ...entry }, ...(state.feed || [])].slice(0, 10);
+  const feed = [{ id: genId(), ...entry }, ...(state.feed || [])].slice(0, FEED_LENGTH);
   return { ...state, feed };
 }
 
 export default function ApertureGame() {
+  const [uid, setUid] = useState(null);
+  const [authError, setAuthError] = useState("");
+
   const [screen, setScreen] = useState("landing"); // landing | create | join | room
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [isHost, setIsHost] = useState(false);
-  const [room, setRoom] = useState(null);
-  const [players, setPlayers] = useState([]);
+
+  const [state, setState] = useState(null);
+  const [players, setPlayers] = useState({});
+  const [setlist, setSetlist] = useState([]); // host-only; players never read this
+  const [frame, setFrame] = useState(null);
+
   const [error, setError] = useState("");
+  const [frameError, setFrameError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const roomLive = useRef(null); // always-current room snapshot for listener callbacks
-  useEffect(() => {
-    roomLive.current = room;
-  }, [room]);
+  // Always-current snapshots for listener and transaction callbacks.
+  const stateLive = useRef(null);
+  const playersLive = useRef({});
+  const setlistLive = useRef([]);
+  useEffect(() => { stateLive.current = state; }, [state]);
+  useEffect(() => { playersLive.current = players; }, [players]);
+  useEffect(() => { setlistLive.current = setlist; }, [setlist]);
 
-  /* ---------- subscribe to room state + players ---------- */
   useEffect(() => {
-    if (screen !== "room" || !code) return;
-    const sRef = roomRef(code);
-    const pRef = playersRef(code);
+    authReady.then(setUid).catch((e) => setAuthError(e?.message || "Could not sign in anonymously."));
+  }, []);
 
-    const unsubState = onValue(sRef, (snap) => {
-      const val = snap.val();
-      if (val) {
-        // Firebase can drop empty objects/arrays; normalize defensively
-        val.rounds = val.rounds || [];
+  /* ---------- public room data: state, players, current frame ---------- */
+  useEffect(() => {
+    if (screen !== "room" || !code || !uid) return;
+    const unsubs = [
+      onValue(stateRef(code), (snap) => {
+        const val = snap.val();
+        if (!val) return;
+        // Firebase drops empty objects/arrays; normalize defensively.
         val.scores = val.scores || {};
-        val.creditedThisRound = val.creditedThisRound || {};
+        val.credited = val.credited || {};
         val.feed = val.feed || [];
-        setRoom(val);
-      }
-    });
-    const unsubPlayers = onValue(pRef, (snap) => {
-      const val = snap.val() || {};
-      setPlayers(Object.values(val).map((p) => p.name));
-    });
+        setState(val);
+      }),
+      onValue(playersRef(code), (snap) => setPlayers(snap.val() || {})),
+      onValue(frameRef(code), (snap) => setFrame(snap.val() || null)),
+    ];
+    return () => unsubs.forEach((stop) => stop());
+  }, [screen, code, uid]);
 
-    return () => {
-      unsubState();
-      unsubPlayers();
-    };
-  }, [screen, code]);
-
-  /* ---------- host: listen for guess submissions on the current round ---------- */
+  /* ---------- host-only: the setlist with answers ---------- */
   useEffect(() => {
-    if (!isHost || !room || room.status !== "playing") return;
-    const subRef = submissionsRef(code, room.currentIndex);
+    if (!isHost || screen !== "room" || !code || !uid) return;
+    return onValue(setlistRef(code), (snap) => setSetlist(snap.val() || []));
+  }, [isHost, screen, code, uid]);
 
-    const unsub = onChildAdded(subRef, (snap) => {
+  /* ---------- host-only: grade incoming guesses ---------- */
+  useEffect(() => {
+    if (!isHost || !code || state?.status !== "playing") return;
+    const round = state.currentIndex;
+
+    return onChildAdded(submissionsRef(code, round), (snap) => {
+      const guesser = snap.key;
       const sub = snap.val();
-      const cur = roomLive.current;
-      if (!cur || !sub) return;
-      if (cur.creditedThisRound && cur.creditedThisRound[sub.name]) return;
-      const round = cur.rounds[cur.currentIndex];
-      if (!round) return;
-      if (!isCorrect(sub.text, round.answer)) return;
+      if (!sub?.text) return;
 
-      const rank = Object.keys(cur.creditedThisRound || {}).length;
-      const base = STAGES[cur.stage].points;
-      const pts = rank === 0 ? base : rank === 1 ? Math.round(base / 2) : Math.max(50, Math.round(base / 4));
+      const answer = setlistLive.current[round]?.answer;
+      if (!answer || !isCorrect(sub.text, answer)) return;
+      const guesserName = playersLive.current[guesser]?.name || "Someone";
 
-      let next = {
-        ...cur,
-        creditedThisRound: { ...cur.creditedThisRound, [sub.name]: true },
-        scores: { ...cur.scores, [sub.name]: (cur.scores[sub.name] || 0) + pts },
-      };
-      next = pushFeed(next, { type: "correct", text: `${sub.name} nailed it — +${pts}` });
-      next.updatedAt = Date.now();
-      set(roomRef(code), next);
+      // A transaction, because several correct guesses can land at once and
+      // each one needs to see the previous one's credit.
+      runTransaction(stateRef(code), (cur) => {
+        if (!cur || cur.currentIndex !== round || !cur.roundActive) return;
+        if (cur.credited?.[guesser]) return;
+
+        const rank = Object.keys(cur.credited || {}).length;
+        const pts = awardPoints(cur.stage, rank, !!cur.hintUsed);
+
+        const scored = {
+          ...cur,
+          credited: { ...(cur.credited || {}), [guesser]: true },
+          scores: { ...(cur.scores || {}), [guesser]: (cur.scores?.[guesser] || 0) + pts },
+        };
+        return { ...pushFeed(scored, { type: "correct", text: `${guesserName} nailed it — +${pts}` }), updatedAt: Date.now() };
+      });
     });
+  }, [isHost, code, state?.status, state?.currentIndex]);
 
-    return () => unsub();
-  }, [isHost, code, room?.status, room?.currentIndex]);
+  /* ---------- host-only: render and publish the current aperture frame ---------- */
+  const framesCache = useRef({ round: -1, frames: null });
+
+  useEffect(() => {
+    if (!isHost || !code || state?.status !== "playing") return;
+    const round = state.currentIndex;
+    const stage = state.stage;
+    const url = setlist[round]?.url;
+    if (!url) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        if (framesCache.current.round !== round) {
+          setFrameError("");
+          const frames = await renderRoundFrames(url);
+          if (cancelled) return;
+          framesCache.current = { round, frames };
+        }
+        const { frames } = framesCache.current;
+        if (!frames || cancelled) return;
+        await set(frameRef(code), { roundIndex: round, stage, src: frames[stage], at: Date.now() });
+
+        // Warm the next image so the round change isn't waiting on the network.
+        const nextUrl = setlistLive.current[round + 1]?.url;
+        if (nextUrl && !cancelled) loadImage(nextUrl).catch(() => {});
+      } catch (e) {
+        if (!cancelled) {
+          setFrameError(e instanceof ImageSourceError ? e.message : "Could not prepare this image.");
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [isHost, code, state?.status, state?.currentIndex, state?.stage, setlist]);
+
+  /* ---------- host state writes ---------- */
+  const mutateState = useCallback(
+    (mutator) => {
+      const cur = stateLive.current;
+      if (!cur) return;
+      const next = mutator({ ...cur });
+      if (!next) return;
+      next.updatedAt = Date.now();
+      set(stateRef(code), next).catch((e) => setError(e?.message || "That change was rejected."));
+    },
+    [code],
+  );
 
   /* ---------- actions ---------- */
-  const handleCreate = async () => {
+  const createRoom = async () => {
+    if (!uid) return;
     if (!name.trim()) return setError("Enter your name first.");
     setBusy(true);
-    const c = genCode();
-    const st = freshState(c, name.trim());
-    await set(roomRef(c), st);
-    await set(child(playersRef(c), safeKey(name)), { name: name.trim(), joinedAt: Date.now() });
-    setCode(c);
-    setIsHost(true);
-    setRoom(st);
-    setScreen("room");
-    setBusy(false);
+    setError("");
+    const hostName = name.trim().slice(0, MAX_NAME);
+
+    try {
+      let claimed = null;
+      for (let attempt = 0; attempt < 5 && !claimed; attempt++) {
+        const candidate = genCode();
+        try {
+          // meta is create-once in the rules, so this doubles as the
+          // room-code collision check and the host's claim on the room.
+          await set(metaRef(candidate), { hostUid: uid, createdAt: Date.now() });
+          claimed = candidate;
+        } catch {
+          /* code already taken — try another */
+        }
+      }
+      if (!claimed) throw new Error("Couldn't find a free room code. Try again.");
+
+      await set(setlistRef(claimed), STARTER_ROUNDS.map((r) => ({ ...r })));
+      await set(stateRef(claimed), freshState(claimed, hostName, STARTER_ROUNDS.length));
+      await set(playerRef(claimed, uid), { name: hostName, joinedAt: Date.now() });
+
+      setCode(claimed);
+      setIsHost(true);
+      setScreen("room");
+    } catch (e) {
+      setError(e?.message || "Could not create the room.");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const handleJoin = async () => {
+  const joinRoom = async () => {
+    if (!uid) return;
     if (!name.trim()) return setError("Enter your name first.");
     if (!code.trim()) return setError("Enter the 4-letter room code.");
     setBusy(true);
-    const c = code.trim().toUpperCase();
-    const snap = await get(roomRef(c));
-    const st = snap.val();
-    if (!st) {
-      setError("No room found with that code.");
-      setBusy(false);
-      return;
-    }
-    await set(child(playersRef(c), safeKey(name)), { name: name.trim(), joinedAt: Date.now() });
-    setCode(c);
-    setIsHost(false);
-    setRoom(st);
-    setScreen("room");
     setError("");
-    setBusy(false);
-  };
+    const target = code.trim().toUpperCase();
+    const playerName = name.trim().slice(0, MAX_NAME);
 
-  const updateRoom = (mutator) => {
-    setRoom((prev) => {
-      if (!prev) return prev;
-      const next = mutator({ ...prev });
-      next.updatedAt = Date.now();
-      set(roomRef(code), next);
-      return next;
-    });
-  };
-
-  const addRound = (url, answer, hint) => {
-    updateRoom((s) => ({ ...s, rounds: [...s.rounds, { id: genId(), url, answer, hint }] }));
-  };
-  const removeRound = (id) => {
-    updateRoom((s) => ({ ...s, rounds: s.rounds.filter((r) => r.id !== id) }));
-  };
-  const startGame = () => {
-    updateRoom((s) => pushFeed({ ...s, status: "playing", currentIndex: 0, stage: 0, roundActive: true, creditedThisRound: {} }, { type: "system", text: `Round 1: the aperture opens…` }));
-  };
-  const openAperture = () => {
-    updateRoom((s) => (s.stage < STAGES.length - 1 ? { ...s, stage: s.stage + 1 } : s));
-  };
-  const revealAnswer = () => {
-    updateRoom((s) => pushFeed({ ...s, roundActive: false }, { type: "reveal", text: `Answer: ${s.rounds[s.currentIndex]?.answer}` }));
-  };
-  const nextRound = () => {
-    updateRoom((s) => {
-      const ni = s.currentIndex + 1;
-      if (ni >= s.rounds.length) {
-        return pushFeed({ ...s, status: "ended" }, { type: "system", text: "That's a wrap! Final scores are in." });
+    try {
+      const meta = await get(metaRef(target));
+      if (!meta.exists()) {
+        setError("No room found with that code.");
+        return;
       }
-      return pushFeed({ ...s, currentIndex: ni, stage: 0, roundActive: true, creditedThisRound: {} }, { type: "system", text: `Round ${ni + 1}: the aperture opens…` });
-    });
+      await set(playerRef(target, uid), { name: playerName, joinedAt: Date.now() });
+      setCode(target);
+      setIsHost(meta.val().hostUid === uid); // lets a host who reloaded resume hosting
+      setScreen("room");
+    } catch (e) {
+      setError(e?.message || "Could not join that room.");
+    } finally {
+      setBusy(false);
+    }
   };
+
+  const addRound = async (url, answer, hint) => {
+    setError("");
+    try {
+      await assertUsableImage(url);
+    } catch (e) {
+      setError(e instanceof ImageSourceError ? e.message : "Could not use that image.");
+      return false;
+    }
+    const next = [...setlistLive.current, { id: genId(), url, answer, hint }];
+    await set(setlistRef(code), next);
+    mutateState((s) => ({ ...s, roundCount: next.length }));
+    return true;
+  };
+
+  const removeRound = async (id) => {
+    const next = setlistLive.current.filter((r) => r.id !== id);
+    await set(setlistRef(code), next);
+    mutateState((s) => ({ ...s, roundCount: next.length }));
+  };
+
+  const startGame = () =>
+    mutateState((s) =>
+      pushFeed(
+        { ...s, status: "playing", currentIndex: 0, stage: 0, roundActive: true, credited: {}, reveal: null, hint: null, hintUsed: false },
+        { type: "system", text: "Round 1: the aperture opens…" },
+      ),
+    );
+
+  const openAperture = () =>
+    mutateState((s) => (s.stage < STAGES.length - 1 ? { ...s, stage: s.stage + 1 } : null));
+
+  const revealHint = () =>
+    mutateState((s) => {
+      if (s.hintUsed || !s.roundActive) return null;
+      const hint = (setlistLive.current[s.currentIndex]?.hint || "").trim();
+      if (!hint) return null;
+      return pushFeed(
+        { ...s, hintUsed: true, hint },
+        { type: "hint", text: `Hint revealed — scores halved. “${hint}”` },
+      );
+    });
+
+  const revealAnswer = () =>
+    mutateState((s) => {
+      const answer = setlistLive.current[s.currentIndex]?.answer || "—";
+      return pushFeed(
+        { ...s, roundActive: false, stage: STAGES.length - 1, reveal: { answer } },
+        { type: "reveal", text: `Answer: ${answer}` },
+      );
+    });
+
+  const nextRound = () =>
+    mutateState((s) => {
+      const next = s.currentIndex + 1;
+      if (next >= (s.roundCount || 0)) {
+        return pushFeed({ ...s, status: "ended", roundActive: false }, { type: "system", text: "That's a wrap! Final scores are in." });
+      }
+      return pushFeed(
+        { ...s, currentIndex: next, stage: 0, roundActive: true, credited: {}, reveal: null, hint: null, hintUsed: false },
+        { type: "system", text: `Round ${next + 1}: the aperture opens…` },
+      );
+    });
 
   const submitGuess = async (text) => {
-    if (!room || !room.roundActive) return;
-    await push(submissionsRef(code, room.currentIndex), { name: name.trim(), text, ts: Date.now() });
+    const cur = stateLive.current;
+    if (!cur?.roundActive || !uid) return;
+    await set(submissionRef(code, cur.currentIndex, uid), { text: text.slice(0, MAX_GUESS), ts: Date.now() });
   };
 
+  /* ---------- derived view data ---------- */
+  const playerList = useMemo(
+    () =>
+      Object.entries(players)
+        .map(([id, p]) => ({ uid: id, name: p?.name || "—", joinedAt: p?.joinedAt || 0 }))
+        .sort((a, b) => a.joinedAt - b.joinedAt),
+    [players],
+  );
+
+  const leaderboard = useMemo(
+    () =>
+      Object.entries(state?.scores || {})
+        .map(([id, pts]) => ({ uid: id, pts, name: players[id]?.name || "—" }))
+        .sort((a, b) => b.pts - a.pts),
+    [state?.scores, players],
+  );
+
   /* ---------- render ---------- */
+  if (authError) {
+    return (
+      <div style={S.app}>
+        <GlobalStyle />
+        <div style={S.centerWrap}>
+          <div style={S.eyebrow}>SHUTTER JAMMED</div>
+          <p style={S.tagline}>{authError}</p>
+          <div style={S.footNote}>
+            Enable Anonymous sign-in under Authentication → Sign-in method in the Firebase console, then reload.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!uid) {
+    return (
+      <div style={S.app}>
+        <GlobalStyle />
+        <div style={S.centerWrap}>
+          <LensMark />
+          <div style={S.eyebrow}>CALIBRATING…</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={S.app}>
       <GlobalStyle />
@@ -234,7 +372,7 @@ export default function ApertureGame() {
           error={error}
           busy={busy}
           onBack={() => { setScreen("landing"); setError(""); }}
-          onSubmit={handleCreate}
+          onSubmit={createRoom}
           submitLabel="Create Room"
         />
       )}
@@ -247,27 +385,39 @@ export default function ApertureGame() {
           error={error}
           busy={busy}
           onBack={() => { setScreen("landing"); setError(""); }}
-          onSubmit={handleJoin}
+          onSubmit={joinRoom}
           submitLabel="Join Room"
           showCode
           code={code}
           setCode={setCode}
         />
       )}
-      {screen === "room" && room && (
+      {screen === "room" && state && (
         <RoomView
-          room={room}
-          players={players}
+          room={state}
+          setlist={setlist}
+          frame={frame}
+          players={playerList}
+          leaderboard={leaderboard}
           isHost={isHost}
-          myName={name.trim()}
+          myUid={uid}
+          error={error}
+          frameError={frameError}
           onAddRound={addRound}
           onRemoveRound={removeRound}
           onStart={startGame}
           onOpenAperture={openAperture}
+          onRevealHint={revealHint}
           onReveal={revealAnswer}
           onNext={nextRound}
           onSubmitGuess={submitGuess}
         />
+      )}
+      {screen === "room" && !state && (
+        <div style={S.centerWrap}>
+          <LensMark />
+          <div style={S.eyebrow}>LOADING ROOM…</div>
+        </div>
       )}
     </div>
   );
@@ -275,14 +425,20 @@ export default function ApertureGame() {
 
 /* ──────────────────────── Screens ──────────────────────── */
 
+function LensMark() {
+  return (
+    <div style={S.lensMark}>
+      <div style={S.lensRing} />
+      <div style={S.lensRing2} />
+      <div style={S.lensCore} />
+    </div>
+  );
+}
+
 function Landing({ onCreate, onJoin }) {
   return (
     <div style={S.centerWrap}>
-      <div style={S.lensMark}>
-        <div style={S.lensRing} />
-        <div style={S.lensRing2} />
-        <div style={S.lensCore} />
-      </div>
+      <LensMark />
       <div style={S.eyebrow}>OFFICE PARTY GAME</div>
       <h1 style={S.h1}>APERTURE</h1>
       <p style={S.tagline}>Guess the picture before the lens opens all the way.</p>
@@ -306,7 +462,7 @@ function NameGate({ title, sub, name, setName, code, setCode, error, busy, onBac
           style={S.input}
           placeholder="Your name"
           value={name}
-          maxLength={20}
+          maxLength={MAX_NAME}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !showCode && onSubmit()}
         />
@@ -329,17 +485,42 @@ function NameGate({ title, sub, name, setName, code, setCode, error, busy, onBac
   );
 }
 
-function RoomView({ room, players, isHost, myName, onAddRound, onRemoveRound, onStart, onOpenAperture, onReveal, onNext, onSubmitGuess }) {
+function RoomView({
+  room, setlist, frame, players, leaderboard, isHost, myUid, error, frameError,
+  onAddRound, onRemoveRound, onStart, onOpenAperture, onRevealHint, onReveal, onNext, onSubmitGuess,
+}) {
   return (
     <div style={S.roomWrap}>
       <TopBar room={room} players={players} isHost={isHost} />
+      {error && <div style={S.banner}>{error}</div>}
       {room.status === "lobby" && (
-        <Lobby room={room} players={players} isHost={isHost} onAddRound={onAddRound} onRemoveRound={onRemoveRound} onStart={onStart} />
+        <Lobby
+          room={room}
+          setlist={setlist}
+          players={players}
+          isHost={isHost}
+          onAddRound={onAddRound}
+          onRemoveRound={onRemoveRound}
+          onStart={onStart}
+        />
       )}
       {room.status === "playing" && (
-        <PlayScreen room={room} isHost={isHost} myName={myName} onOpenAperture={onOpenAperture} onReveal={onReveal} onNext={onNext} onSubmitGuess={onSubmitGuess} />
+        <PlayScreen
+          room={room}
+          setlist={setlist}
+          frame={frame}
+          leaderboard={leaderboard}
+          isHost={isHost}
+          myUid={myUid}
+          frameError={frameError}
+          onOpenAperture={onOpenAperture}
+          onRevealHint={onRevealHint}
+          onReveal={onReveal}
+          onNext={onNext}
+          onSubmitGuess={onSubmitGuess}
+        />
       )}
-      {room.status === "ended" && <EndScreen room={room} />}
+      {room.status === "ended" && <EndScreen leaderboard={leaderboard} />}
     </div>
   );
 }
@@ -359,44 +540,65 @@ function TopBar({ room, players, isHost }) {
   );
 }
 
-function Lobby({ room, players, isHost, onAddRound, onRemoveRound, onStart }) {
+function Lobby({ room, setlist, players, isHost, onAddRound, onRemoveRound, onStart }) {
   const [url, setUrl] = useState("");
   const [answer, setAnswer] = useState("");
   const [hint, setHint] = useState("");
+  const [checking, setChecking] = useState(false);
+
+  const submitRound = async () => {
+    if (!url.trim() || !answer.trim()) return;
+    setChecking(true);
+    const ok = await onAddRound(url.trim(), answer.trim(), hint.trim());
+    setChecking(false);
+    if (ok) { setUrl(""); setAnswer(""); setHint(""); }
+  };
 
   return (
     <div style={S.lobbyGrid}>
       <div style={S.panel}>
-        <div style={S.panelTitle}>ROUNDS ({room.rounds.length})</div>
-        <div style={S.roundList}>
-          {room.rounds.map((r, i) => (
-            <div key={r.id} style={S.roundRow}>
-              <img src={r.url} alt="" style={S.roundThumb} onError={(e) => (e.target.style.opacity = 0.15)} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>{i + 1}. {r.answer}</div>
-                <div style={{ fontSize: 12, color: "#9C948A" }}>{r.hint}</div>
-              </div>
-              {isHost && <button style={S.smallGhostBtn} onClick={() => onRemoveRound(r.id)}>remove</button>}
+        <div style={S.panelTitle}>{isHost ? `SETLIST (${setlist.length})` : `SETLIST (${room.roundCount || 0})`}</div>
+
+        {isHost ? (
+          <>
+            <div style={S.roundList}>
+              {setlist.map((r, i) => (
+                <div key={r.id} style={S.roundRow}>
+                  <img src={r.url} alt="" style={S.roundThumb} onError={(e) => (e.target.style.opacity = 0.15)} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{i + 1}. {r.answer}</div>
+                    <div style={{ fontSize: 12, color: "#9C948A" }}>{r.hint}</div>
+                  </div>
+                  <button style={S.smallGhostBtn} onClick={() => onRemoveRound(r.id)}>remove</button>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-        {isHost && (
-          <div style={S.addRoundForm}>
-            <div style={S.panelTitle}>ADD YOUR OWN ROUND</div>
-            <input style={S.input} placeholder="Image URL (company photo, logo, meme…)" value={url} onChange={(e) => setUrl(e.target.value)} />
-            <input style={S.input} placeholder="Answer" value={answer} onChange={(e) => setAnswer(e.target.value)} />
-            <input style={S.input} placeholder="Hint (optional)" value={hint} onChange={(e) => setHint(e.target.value)} />
-            <button
-              style={S.btnGhost}
-              onClick={() => {
-                if (!url.trim() || !answer.trim()) return;
-                onAddRound(url.trim(), answer.trim(), hint.trim());
-                setUrl(""); setAnswer(""); setHint("");
-              }}
-            >
-              + Add Round
-            </button>
-          </div>
+            <div style={S.hostOnlyNote}>Only you can see this list. Players just see how many rounds are queued.</div>
+            <div style={S.addRoundForm}>
+              <div style={S.panelTitle}>ADD YOUR OWN ROUND</div>
+              <input style={S.input} placeholder="Image URL (company photo, logo, meme…)" value={url} onChange={(e) => setUrl(e.target.value)} />
+              <input style={S.input} placeholder="Answer" value={answer} onChange={(e) => setAnswer(e.target.value)} />
+              <input style={S.input} placeholder="Hint (optional)" value={hint} onChange={(e) => setHint(e.target.value)} />
+              <button style={S.btnGhost} onClick={submitRound} disabled={checking}>
+                {checking ? "checking image…" : "+ Add Round"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={S.roundList}>
+              {Array.from({ length: room.roundCount || 0 }, (_, i) => (
+                <div key={i} style={S.roundRow}>
+                  <div style={S.sealedThumb}>◉</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14, color: "#9C948A" }}>Round {i + 1}</div>
+                    <div style={{ fontSize: 12, color: "#6B6459" }}>sealed</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={S.hostOnlyNote}>Subjects stay sealed until the lens opens on them.</div>
+          </>
         )}
       </div>
 
@@ -405,13 +607,11 @@ function Lobby({ room, players, isHost, onAddRound, onRemoveRound, onStart }) {
         <div style={S.playerChips}>
           {players.length === 0 && <div style={{ color: "#9C948A", fontSize: 13 }}>Waiting for people to join…</div>}
           {players.map((p) => (
-            <div key={p} style={S.chip}>{p}{p === room.host ? " · host" : ""}</div>
+            <div key={p.uid} style={S.chip}>{p.name}{p.name === room.host ? " · host" : ""}</div>
           ))}
         </div>
         {isHost ? (
-          <button style={S.btnPrimary} disabled={room.rounds.length === 0} onClick={onStart}>
-            Start Game
-          </button>
+          <button style={S.btnPrimary} disabled={setlist.length === 0} onClick={onStart}>Start Game</button>
         ) : (
           <div style={S.waitingNote}>Waiting for {room.host} to start the game…</div>
         )}
@@ -420,52 +620,104 @@ function Lobby({ room, players, isHost, onAddRound, onRemoveRound, onStart }) {
   );
 }
 
-function PlayScreen({ room, isHost, myName, onOpenAperture, onReveal, onNext, onSubmitGuess }) {
-  const round = room.rounds[room.currentIndex];
+// Cross-dissolves between published frames so the aperture still reads as
+// opening, even though each stage arrives as a discrete flattened image.
+function ApertureFrame({ src }) {
+  const previous = useRef(null);
+  const behind = previous.current !== src ? previous.current : null;
+  useEffect(() => { previous.current = src; }, [src]);
+
+  return (
+    <>
+      {behind && <img src={behind} alt="" aria-hidden="true" style={S.frameImg} />}
+      <img key={src} src={src} alt="" style={{ ...S.frameImg, animation: "apertureIn 900ms ease-out both" }} />
+    </>
+  );
+}
+
+function PlayScreen({
+  room, setlist, frame, leaderboard, isHost, myUid, frameError,
+  onOpenAperture, onRevealHint, onReveal, onNext, onSubmitGuess,
+}) {
   const stage = STAGES[room.stage];
+  const worth = stagePoints(room.stage, !!room.hintUsed);
+  const hostRound = isHost ? setlist[room.currentIndex] : null;
+  const hasHint = !!(hostRound?.hint || room.hint);
   const [guess, setGuess] = useState("");
-  const [submitted, setSubmitted] = useState(false);
-  const [imgError, setImgError] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | sending | sent | error
+  const [statusMsg, setStatusMsg] = useState("");
 
   useEffect(() => {
-    setSubmitted(false);
     setGuess("");
-    setImgError(false);
+    setStatus("idle");
+    setStatusMsg("");
   }, [room.currentIndex]);
 
-  const scoresSorted = Object.entries(room.scores).sort((a, b) => b[1] - a[1]);
+  // Never show a frame from a previous round, and never one that is further
+  // open than the round's current stage.
+  const liveFrame =
+    frame && frame.roundIndex === room.currentIndex && frame.stage <= room.stage ? frame.src : null;
 
-  const doSubmit = () => {
-    if (!guess.trim() || submitted || !room.roundActive) return;
-    onSubmitGuess(guess.trim());
-    setSubmitted(true);
+  const doSubmit = async () => {
+    if (!guess.trim() || status === "sending" || status === "sent" || !room.roundActive) return;
+    setStatus("sending");
+    try {
+      await onSubmitGuess(guess.trim());
+      setStatus("sent");
+    } catch {
+      setStatus("error");
+      setStatusMsg("Guess rejected — one guess per round.");
+    }
   };
 
   return (
     <div style={S.playGrid}>
       <div style={S.viewportPanel}>
         <div style={S.roundMeta}>
-          <span style={S.mono}>ROUND {room.currentIndex + 1} / {room.rounds.length}</span>
-          <span style={{ ...S.mono, color: "#FFB454" }}>{stage.label} · worth {stage.points}</span>
+          <span style={S.mono}>ROUND {room.currentIndex + 1} / {room.roundCount}</span>
+          <span style={{ ...S.mono, color: "#FFB454" }}>
+            {stage.label} · worth {worth}{room.hintUsed ? " (hint)" : ""}
+          </span>
         </div>
 
+        {room.hint && (
+          <div style={S.hintLive}>Hint: “{room.hint}”</div>
+        )}
+
+        {isHost && (
+          <div style={S.hostControls}>
+            {frameError && <div style={S.error}>{frameError}</div>}
+            {hostRound?.hint && !room.hintUsed && (
+              <div style={S.hintText}>Hint on card: “{hostRound.hint}” — players can’t see this yet.</div>
+            )}
+            {room.roundActive ? (
+              <div style={S.btnRow}>
+                <button style={S.btnGhost} disabled={room.stage >= STAGES.length - 1} onClick={onOpenAperture}>
+                  Open Aperture
+                </button>
+                {hasHint && (
+                  <button style={S.btnGhost} disabled={!!room.hintUsed} onClick={onRevealHint}>
+                    {room.hintUsed ? "Hint live" : "Reveal Hint"}
+                  </button>
+                )}
+                <button style={S.btnPrimary} onClick={onReveal}>Reveal Answer</button>
+              </div>
+            ) : (
+              <div style={S.btnRow}>
+                <button style={S.btnPrimary} onClick={onNext}>
+                  {room.currentIndex + 1 >= room.roundCount ? "Finish Game" : "Next Round"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         <div style={S.viewport}>
-          {imgError ? (
-            <div style={S.imgFallback}>Image didn't load. {isHost ? "Skip this round with Next." : "Ask the host to skip."}</div>
+          {liveFrame ? (
+            <ApertureFrame src={liveFrame} />
           ) : (
-            <img
-              src={round.url}
-              alt=""
-              onError={() => setImgError(true)}
-              style={{ ...S.viewportImg, transform: `scale(${stage.scale})` }}
-            />
+            <div style={S.developing}>{frameError || "Developing…"}</div>
           )}
-          <div
-            style={{
-              ...S.vignette,
-              background: `radial-gradient(circle at 50% 50%, transparent ${stage.vignette}%, rgba(10,8,6,0.97) ${stage.vignette + 16}%)`,
-            }}
-          />
           <div style={S.apertureTicks}>
             {STAGES.map((s, i) => (
               <div key={i} style={{ ...S.tick, opacity: i <= room.stage ? 1 : 0.25, background: i <= room.stage ? "#FFB454" : "#5A5248" }} />
@@ -473,60 +725,49 @@ function PlayScreen({ room, isHost, myName, onOpenAperture, onReveal, onNext, on
           </div>
         </div>
 
-        {!isHost && (
-          <div style={S.guessRow}>
-            <input
-              style={{ ...S.input, flex: 1 }}
-              placeholder={room.roundActive ? "Type your guess…" : "Waiting for next round…"}
-              value={guess}
-              disabled={!room.roundActive || submitted}
-              onChange={(e) => setGuess(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && doSubmit()}
-            />
-            <button style={S.btnPrimary} disabled={!room.roundActive || submitted} onClick={doSubmit}>
-              {submitted ? "Sent ✓" : "Guess"}
-            </button>
-          </div>
+        {!room.roundActive && room.reveal?.answer && (
+          <div style={S.answerReveal}>It was: <strong>{room.reveal.answer}</strong></div>
         )}
 
-        {isHost && (
-          <div style={S.hostControls}>
-            {round.hint && <div style={S.hintText}>Hint on card: “{round.hint}”</div>}
-            {room.roundActive ? (
-              <div style={S.btnRow}>
-                <button style={S.btnGhost} disabled={room.stage >= STAGES.length - 1} onClick={onOpenAperture}>
-                  Open Aperture
-                </button>
-                <button style={S.btnPrimary} onClick={onReveal}>Reveal Answer</button>
-              </div>
-            ) : (
-              <div style={S.btnRow}>
-                <div style={S.answerReveal}>It was: <strong>{round.answer}</strong></div>
-                <button style={S.btnPrimary} onClick={onNext}>
-                  {room.currentIndex + 1 >= room.rounds.length ? "Finish Game" : "Next Round"}
-                </button>
-              </div>
-            )}
-          </div>
+        {!isHost && (
+          <>
+            <div style={S.guessRow}>
+              <input
+                style={{ ...S.input, flex: 1 }}
+                placeholder={room.roundActive ? "Type your guess…" : "Waiting for next round…"}
+                value={guess}
+                maxLength={MAX_GUESS}
+                disabled={!room.roundActive || status === "sent" || status === "sending"}
+                onChange={(e) => setGuess(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && doSubmit()}
+              />
+              <button style={S.btnPrimary} disabled={!room.roundActive || status === "sent" || status === "sending"} onClick={doSubmit}>
+                {status === "sent" ? "Sent ✓" : status === "sending" ? "…" : "Guess"}
+              </button>
+            </div>
+            {statusMsg && <div style={S.error}>{statusMsg}</div>}
+          </>
         )}
       </div>
 
       <div style={S.sidePanel}>
         <div style={S.panelTitle}>LEADERBOARD</div>
         <div style={S.leaderboard}>
-          {scoresSorted.length === 0 && <div style={{ color: "#9C948A", fontSize: 13 }}>No points yet — be first!</div>}
-          {scoresSorted.map(([n, pts], i) => (
-            <div key={n} style={S.leaderRow}>
+          {leaderboard.length === 0 && <div style={{ color: "#9C948A", fontSize: 13 }}>No points yet — be first!</div>}
+          {leaderboard.map((row, i) => (
+            <div key={row.uid} style={S.leaderRow}>
               <span style={S.mono}>#{i + 1}</span>
-              <span style={{ flex: 1, fontWeight: n === myName ? 700 : 400 }}>{n}{n === myName ? " (you)" : ""}</span>
-              <span style={{ ...S.mono, color: "#FFB454" }}>{pts}</span>
+              <span style={{ flex: 1, fontWeight: row.uid === myUid ? 700 : 400 }}>
+                {row.name}{row.uid === myUid ? " (you)" : ""}
+              </span>
+              <span style={{ ...S.mono, color: "#FFB454" }}>{row.pts}</span>
             </div>
           ))}
         </div>
         <div style={S.panelTitle}>FEED</div>
         <div style={S.feedList}>
           {room.feed.map((f) => (
-            <div key={f.id} style={{ ...S.feedItem, color: f.type === "correct" ? "#34D8B0" : f.type === "reveal" ? "#FFB454" : "#9C948A" }}>
+            <div key={f.id} style={{ ...S.feedItem, color: f.type === "correct" ? "#34D8B0" : f.type === "reveal" || f.type === "hint" ? "#FFB454" : "#9C948A" }}>
               {f.text}
             </div>
           ))}
@@ -536,8 +777,7 @@ function PlayScreen({ room, isHost, myName, onOpenAperture, onReveal, onNext, on
   );
 }
 
-function EndScreen({ room }) {
-  const scoresSorted = Object.entries(room.scores).sort((a, b) => b[1] - a[1]);
+function EndScreen({ leaderboard }) {
   return (
     <div style={S.centerWrap}>
       <div style={S.eyebrow}>GAME OVER</div>
@@ -545,12 +785,12 @@ function EndScreen({ room }) {
       <div style={{ ...S.panel, width: "100%", maxWidth: 420 }}>
         <div style={S.panelTitle}>FINAL SCORES</div>
         <div style={S.leaderboard}>
-          {scoresSorted.length === 0 && <div style={{ color: "#9C948A" }}>Nobody scored — tough crowd.</div>}
-          {scoresSorted.map(([n, pts], i) => (
-            <div key={n} style={S.leaderRow}>
+          {leaderboard.length === 0 && <div style={{ color: "#9C948A" }}>Nobody scored — tough crowd.</div>}
+          {leaderboard.map((row, i) => (
+            <div key={row.uid} style={S.leaderRow}>
               <span style={S.mono}>{i === 0 ? "🏆" : `#${i + 1}`}</span>
-              <span style={{ flex: 1 }}>{n}</span>
-              <span style={{ ...S.mono, color: "#FFB454" }}>{pts}</span>
+              <span style={{ flex: 1 }}>{row.name}</span>
+              <span style={{ ...S.mono, color: "#FFB454" }}>{row.pts}</span>
             </div>
           ))}
         </div>
@@ -574,6 +814,7 @@ function GlobalStyle() {
       button { cursor: pointer; font-family: 'Inter', sans-serif; transition: transform 0.12s ease, background 0.12s ease; }
       button:hover:not(:disabled) { transform: translateY(-1px); }
       button:disabled { opacity: 0.4; cursor: not-allowed; }
+      @keyframes apertureIn { from { opacity: 0; transform: scale(1.04); } to { opacity: 1; transform: none; } }
       @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
     `}</style>
   );
@@ -590,24 +831,27 @@ const S = {
   eyebrow: { fontFamily: "'JetBrains Mono', monospace", fontSize: 12, letterSpacing: "0.3em", color: "#9C948A", marginTop: 8 },
   h1: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 48, letterSpacing: "0.04em", margin: "4px 0 8px" },
   tagline: { color: "#9C948A", fontSize: 15, marginBottom: 24, maxWidth: 340 },
-  btnRow: { display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" },
+  btnRow: { display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center", alignItems: "center" },
   btnPrimary: { background: "#FFB454", color: "#1A1310", border: "none", borderRadius: 8, padding: "12px 22px", fontWeight: 700, fontSize: 14, letterSpacing: "0.02em" },
   btnGhost: { background: "transparent", color: "#F3EEE4", border: "1px solid #3A342C", borderRadius: 8, padding: "12px 22px", fontWeight: 600, fontSize: 14 },
   smallGhostBtn: { background: "transparent", color: "#9C948A", border: "1px solid #3A342C", borderRadius: 6, padding: "4px 8px", fontSize: 11 },
-  footNote: { marginTop: 24, fontSize: 12, color: "#6B6459" },
+  footNote: { marginTop: 24, fontSize: 12, color: "#6B6459", maxWidth: 380 },
   backBtn: { alignSelf: "flex-start", background: "none", border: "none", color: "#9C948A", fontSize: 13, marginBottom: 12 },
   formCol: { display: "flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 320 },
   input: { background: "#1A1613", border: "1px solid #3A342C", borderRadius: 8, color: "#F3EEE4", padding: "12px 14px", fontSize: 14, fontFamily: "'Inter', sans-serif" },
   error: { color: "#E2604F", fontSize: 13 },
+  banner: { background: "#2A1A16", border: "1px solid #E2604F", color: "#E2604F", borderRadius: 8, padding: "10px 14px", fontSize: 13, marginBottom: 16 },
   roomWrap: { maxWidth: 920, margin: "0 auto" },
   topBar: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: "1px solid #3A342C", paddingBottom: 14, marginBottom: 20 },
   topBarLabel: { fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: "0.2em", color: "#6B6459" },
   lobbyGrid: { display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16 },
   panel: { background: "#1A1613", border: "1px solid #2A251F", borderRadius: 12, padding: 18 },
   panelTitle: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.2em", color: "#6B6459", marginBottom: 10 },
-  roundList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 },
+  roundList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 },
   roundRow: { display: "flex", alignItems: "center", gap: 10 },
   roundThumb: { width: 42, height: 42, objectFit: "cover", borderRadius: 6, background: "#0F0D0B" },
+  sealedThumb: { width: 42, height: 42, borderRadius: 6, background: "#0F0D0B", border: "1px solid #2A251F", display: "flex", alignItems: "center", justifyContent: "center", color: "#3A342C", fontSize: 16 },
+  hostOnlyNote: { fontSize: 11.5, color: "#6B6459", fontStyle: "italic", marginBottom: 14 },
   addRoundForm: { display: "flex", flexDirection: "column", gap: 8, borderTop: "1px solid #2A251F", paddingTop: 14 },
   playerChips: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16, minHeight: 30 },
   chip: { background: "#0F0D0B", border: "1px solid #3A342C", borderRadius: 20, padding: "4px 12px", fontSize: 12 },
@@ -616,15 +860,15 @@ const S = {
   viewportPanel: { background: "#1A1613", border: "1px solid #2A251F", borderRadius: 12, padding: 18 },
   roundMeta: { display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 10, color: "#9C948A" },
   viewport: { position: "relative", width: "100%", aspectRatio: "4 / 3", overflow: "hidden", borderRadius: 10, background: "#0A0806" },
-  viewportImg: { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", transition: "transform 1.1s cubic-bezier(0.22,1,0.36,1)" },
-  vignette: { position: "absolute", inset: 0, transition: "background 1.1s ease" },
-  imgFallback: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#9C948A", fontSize: 13, padding: 20, textAlign: "center" },
+  frameImg: { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" },
+  developing: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#6B6459", fontSize: 13, padding: 20, textAlign: "center", fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.1em" },
   apertureTicks: { position: "absolute", bottom: 10, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 5 },
   tick: { width: 18, height: 4, borderRadius: 2, transition: "background 0.3s ease, opacity 0.3s ease" },
   guessRow: { display: "flex", gap: 8, marginTop: 14 },
-  hostControls: { marginTop: 14, display: "flex", flexDirection: "column", gap: 10 },
+  hostControls: { marginBottom: 14, display: "flex", flexDirection: "column", gap: 10 },
   hintText: { color: "#9C948A", fontSize: 13, fontStyle: "italic" },
-  answerReveal: { fontSize: 14, color: "#F3EEE4" },
+  hintLive: { color: "#FFB454", fontSize: 14, fontStyle: "italic", marginBottom: 10 },
+  answerReveal: { fontSize: 14, color: "#F3EEE4", marginTop: 14 },
   sidePanel: { background: "#1A1613", border: "1px solid #2A251F", borderRadius: 12, padding: 18, display: "flex", flexDirection: "column" },
   leaderboard: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 20 },
   leaderRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 14 },
