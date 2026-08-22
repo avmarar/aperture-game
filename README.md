@@ -48,14 +48,20 @@ showed you. The database URL for a default instance looks like
 npm run dev
 ```
 
-Open the printed `localhost` URL. To test multiplayer, open the same URL in a
-second tab (or on a phone/another laptop on the same network using your
-machine's local IP, e.g. `http://192.168.1.23:5173`) — one tab hosts, the rest
-join with the room code.
+Open the printed `localhost` URL. That page is the **host console** — create a
+room, then **Copy player link**. Players open `/join/ABCD` (name only, no host
+button). To test, paste the player link in a second tab, or on a phone using
+your machine's local IP, e.g. `http://192.168.1.23:5173/join/ABCD`.
+
+If someone only has the four-letter code, the landing page has a small
+**Have a room code?** path.
 
 For your team to play together over the internet, deploy the built app
-(`npm run build` → the `dist/` folder) anywhere static, e.g. Vercel,
-Netlify, GitHub Pages, or Firebase Hosting itself.
+(`npm run build` → the `dist/` folder) anywhere static. SPA rewrites are
+included for Vercel (`vercel.json`) and Netlify (`public/_redirects`) so
+`/join/ABCD` loads the app instead of a 404. GitHub Pages needs a
+`404.html` copy of `index.html`; Firebase Hosting needs a rewrite to
+`/index.html`.
 
 ## 6. Publish the security rules
 

@@ -3,6 +3,7 @@ import { get, onChildAdded, onValue, runTransaction, set } from "firebase/databa
 import { authReady } from "./firebase.js";
 import { FEED_LENGTH, MAX_GUESS, MAX_NAME, STAGES, STARTER_ROUNDS, awardPoints, stagePoints } from "./game/constants.js";
 import { genCode, genId, isCorrect } from "./game/text.js";
+import { goHome, goJoin, joinUrl, parseRoomCode } from "./game/route.js";
 import { ImageSourceError, assertUsableImage, loadImage, renderRoundFrames } from "./game/occlusion.js";
 import {
   frameRef,
@@ -49,8 +50,9 @@ export default function ApertureGame() {
   const [uid, setUid] = useState(null);
   const [authError, setAuthError] = useState("");
 
-  const [screen, setScreen] = useState("landing"); // landing | create | join | room
-  const [code, setCode] = useState("");
+  const [screen, setScreen] = useState(() => (parseRoomCode() ? "join" : "landing")); // landing | create | join | room
+  const [code, setCode] = useState(() => parseRoomCode());
+  const [linked, setLinked] = useState(() => !!parseRoomCode()); // arriving via /join/CODE — no code field
   const [name, setName] = useState("");
   const [isHost, setIsHost] = useState(false);
 
@@ -73,6 +75,23 @@ export default function ApertureGame() {
 
   useEffect(() => {
     authReady.then(setUid).catch((e) => setAuthError(e?.message || "Could not sign in anonymously."));
+  }, []);
+
+  useEffect(() => {
+    const onPop = () => {
+      const next = parseRoomCode();
+      setCode(next);
+      setLinked(!!next);
+      setError("");
+      setIsHost(false);
+      setState(null);
+      setPlayers({});
+      setSetlist([]);
+      setFrame(null);
+      setScreen(next ? "join" : "landing");
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
   }, []);
 
   /* ---------- public room data: state, players, current frame ---------- */
@@ -209,7 +228,9 @@ export default function ApertureGame() {
       await set(stateRef(claimed), freshState(claimed, hostName, STARTER_ROUNDS.length));
       await set(playerRef(claimed, uid), { name: hostName, joinedAt: Date.now() });
 
+      goJoin(claimed);
       setCode(claimed);
+      setLinked(true);
       setIsHost(true);
       setScreen("room");
     } catch (e) {
@@ -235,7 +256,9 @@ export default function ApertureGame() {
         return;
       }
       await set(playerRef(target, uid), { name: playerName, joinedAt: Date.now() });
+      goJoin(target);
       setCode(target);
+      setLinked(true);
       setIsHost(meta.val().hostUid === uid); // lets a host who reloaded resume hosting
       setScreen("room");
     } catch (e) {
@@ -362,7 +385,12 @@ export default function ApertureGame() {
   return (
     <div style={S.app}>
       <GlobalStyle />
-      {screen === "landing" && <Landing onCreate={() => setScreen("create")} onJoin={() => setScreen("join")} />}
+      {screen === "landing" && (
+        <Landing
+          onCreate={() => setScreen("create")}
+          onJoinCode={() => { setLinked(false); setCode(""); setError(""); setScreen("join"); }}
+        />
+      )}
       {screen === "create" && (
         <NameGate
           title="HOST A ROOM"
@@ -379,15 +407,21 @@ export default function ApertureGame() {
       {screen === "join" && (
         <NameGate
           title="JOIN A ROOM"
-          sub="Enter your name and the room code."
+          sub={linked ? `You're joining ${code}. Pick a name.` : "Enter your name and the room code."}
           name={name}
           setName={setName}
           error={error}
           busy={busy}
-          onBack={() => { setScreen("landing"); setError(""); }}
+          onBack={() => {
+            goHome();
+            setLinked(false);
+            setCode("");
+            setError("");
+            setScreen("landing");
+          }}
           onSubmit={joinRoom}
           submitLabel="Join Room"
-          showCode
+          showCode={!linked}
           code={code}
           setCode={setCode}
         />
@@ -435,7 +469,7 @@ function LensMark() {
   );
 }
 
-function Landing({ onCreate, onJoin }) {
+function Landing({ onCreate, onJoinCode }) {
   return (
     <div style={S.centerWrap}>
       <LensMark />
@@ -444,9 +478,9 @@ function Landing({ onCreate, onJoin }) {
       <p style={S.tagline}>Guess the picture before the lens opens all the way.</p>
       <div style={S.btnRow}>
         <button style={S.btnPrimary} onClick={onCreate}>Host a Room</button>
-        <button style={S.btnGhost} onClick={onJoin}>Join a Room</button>
       </div>
-      <div style={S.footNote}>7–15 players · one host runs the lens, everyone else guesses</div>
+      <button style={S.linkBtn} onClick={onJoinCode}>Have a room code?</button>
+      <div style={S.footNote}>Share the player link after you host — guests never see the setlist.</div>
     </div>
   );
 }
@@ -532,11 +566,35 @@ function TopBar({ room, players, isHost }) {
         <div style={S.topBarLabel}>ROOM</div>
         <div style={{ ...S.mono, fontSize: 22, letterSpacing: "0.25em", color: "#FFB454" }}>{room.code}</div>
       </div>
-      <div style={{ textAlign: "right" }}>
-        <div style={S.topBarLabel}>{isHost ? "YOU ARE HOSTING" : "PLAYERS"}</div>
-        <div style={{ ...S.mono, fontSize: 14, color: "#9C948A" }}>{players.length} in room</div>
+      <div style={{ textAlign: "right", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+        <div>
+          <div style={S.topBarLabel}>{isHost ? "YOU ARE HOSTING" : "PLAYERS"}</div>
+          <div style={{ ...S.mono, fontSize: 14, color: "#9C948A" }}>{players.length} in room</div>
+        </div>
+        {isHost && <CopyPlayerLink code={room.code} />}
       </div>
     </div>
+  );
+}
+
+function CopyPlayerLink({ code }) {
+  const [copied, setCopied] = useState(false);
+  const url = joinUrl(code);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      window.prompt("Copy this player link", url);
+    }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+
+  return (
+    <button style={S.copyBtn} onClick={copy} title={url}>
+      {copied ? "Copied ✓" : "Copy player link"}
+    </button>
   );
 }
 
@@ -834,6 +892,8 @@ const S = {
   btnRow: { display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center", alignItems: "center" },
   btnPrimary: { background: "#FFB454", color: "#1A1310", border: "none", borderRadius: 8, padding: "12px 22px", fontWeight: 700, fontSize: 14, letterSpacing: "0.02em" },
   btnGhost: { background: "transparent", color: "#F3EEE4", border: "1px solid #3A342C", borderRadius: 8, padding: "12px 22px", fontWeight: 600, fontSize: 14 },
+  linkBtn: { background: "none", border: "none", color: "#9C948A", fontSize: 13, marginTop: 16, textDecoration: "underline", textUnderlineOffset: 3 },
+  copyBtn: { background: "transparent", color: "#FFB454", border: "1px solid #FFB454", borderRadius: 8, padding: "8px 14px", fontWeight: 600, fontSize: 12, letterSpacing: "0.04em" },
   smallGhostBtn: { background: "transparent", color: "#9C948A", border: "1px solid #3A342C", borderRadius: 6, padding: "4px 8px", fontSize: 11 },
   footNote: { marginTop: 24, fontSize: 12, color: "#6B6459", maxWidth: 380 },
   backBtn: { alignSelf: "flex-start", background: "none", border: "none", color: "#9C948A", fontSize: 13, marginBottom: 12 },
@@ -853,8 +913,8 @@ const S = {
   sealedThumb: { width: 42, height: 42, borderRadius: 6, background: "#0F0D0B", border: "1px solid #2A251F", display: "flex", alignItems: "center", justifyContent: "center", color: "#3A342C", fontSize: 16 },
   hostOnlyNote: { fontSize: 11.5, color: "#6B6459", fontStyle: "italic", marginBottom: 14 },
   addRoundForm: { display: "flex", flexDirection: "column", gap: 8, borderTop: "1px solid #2A251F", paddingTop: 14 },
-  playerChips: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16, minHeight: 30 },
-  chip: { background: "#0F0D0B", border: "1px solid #3A342C", borderRadius: 20, padding: "4px 12px", fontSize: 12 },
+  playerChips: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 16, minHeight: 30 },
+  chip: { display: "inline-flex", alignItems: "center", background: "#0F0D0B", border: "1px solid #3A342C", borderRadius: 20, padding: "6px 12px", fontSize: 12, lineHeight: 1 },
   waitingNote: { color: "#9C948A", fontSize: 13 },
   playGrid: { display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 16 },
   viewportPanel: { background: "#1A1613", border: "1px solid #2A251F", borderRadius: 12, padding: 18 },

@@ -1,4 +1,4 @@
-const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ";
+export const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ";
 
 export const genCode = () =>
   Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join("");
